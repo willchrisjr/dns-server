@@ -1,10 +1,11 @@
 import socket
 import struct
+import sys
 
 def encode_domain_name(domain):
     """
     Encodes a domain name into the DNS label format.
-    
+    Example: "example.com" -> b'\x07example\x03com\x00'
     """
     parts = domain.split('.')
     encoded = b''.join(struct.pack('!B', len(part)) + part.encode() for part in parts)
@@ -62,7 +63,25 @@ def parse_dns_query(data):
 
     return packet_id, opcode, rd, qdcount, ancount, nscount, arcount, questions
 
-def build_dns_response(packet_id, opcode, rd, qdcount, questions):
+def forward_dns_query(query, resolver_address):
+    """
+    Forwards the DNS query to the specified resolver and returns the response.
+    """
+    resolver_ip, resolver_port = resolver_address.split(':')
+    resolver_port = int(resolver_port)
+
+    # Create a UDP socket
+    resolver_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    resolver_socket.settimeout(5)  # Set a timeout for the resolver response
+
+    # Send the query to the resolver
+    resolver_socket.sendto(query, (resolver_ip, resolver_port))
+
+    # Receive the response from the resolver
+    response, _ = resolver_socket.recvfrom(512)
+    return response
+
+def build_dns_response(packet_id, opcode, rd, qdcount, questions, answers):
     # DNS Header fields
     flags = 0x8000  # QR (1 bit) = 1 (response)
     flags |= (opcode << 11)  # OPCODE (4 bits)
@@ -75,7 +94,7 @@ def build_dns_response(packet_id, opcode, rd, qdcount, questions):
         rcode = 4  # RCODE (4 bits) = 4 (not implemented)
     flags |= rcode
 
-    ancount = len(questions)  # 16 bits: Number of records in the Answer section.
+    ancount = len(answers)  # 16 bits: Number of records in the Answer section.
     nscount = 0  # 16 bits: Number of records in the Authority section. Expected value: 0.
     arcount = 0  # 16 bits: Number of records in the Additional section. Expected value: 0.
 
@@ -93,19 +112,20 @@ def build_dns_response(packet_id, opcode, rd, qdcount, questions):
 
     # DNS Answer section
     answer_section = b''
-    ttl = 60  # 4 bytes: Time-To-Live
-    rdlength = 4  # 2 bytes: Length of the RDATA field
-    rdata = struct.pack('!4B', 8, 8, 8, 8)  # 4 bytes: IP address (8.8.8.8)
-
-    for domain_name, qtype, qclass in questions:
-        encoded_name = encode_domain_name(domain_name)
-        answer_section += encoded_name + struct.pack('!HHI', qtype, qclass, ttl) + struct.pack('!H', rdlength) + rdata
+    for answer in answers:
+        answer_section += answer
 
     # Combine header, question, and answer to form the full DNS response
     response = header + question_section + answer_section
     return response
 
 def main():
+    if len(sys.argv) != 3 or sys.argv[1] != '--resolver':
+        print("Usage: ./your_server --resolver <address>")
+        sys.exit(1)
+
+    resolver_address = sys.argv[2]
+
     print("Logs from your program will appear here!")
 
     # Create a UDP socket
@@ -122,8 +142,19 @@ def main():
             # Parse the DNS query packet
             packet_id, opcode, rd, qdcount, ancount, nscount, arcount, questions = parse_dns_query(buf)
 
+            # If there are multiple questions, split them into individual queries
+            answers = []
+            for question in questions:
+                domain_name, qtype, qclass = question
+                single_query = struct.pack('!HHHHHH', packet_id, opcode << 11 | rd << 8, 1, 0, 0, 0)
+                single_query += encode_domain_name(domain_name) + struct.pack('!HH', qtype, qclass)
+                response = forward_dns_query(single_query, resolver_address)
+                _, _, _, _, _, _, _, response_questions = parse_dns_query(response)
+                response_offset = 12 + len(encode_domain_name(domain_name)) + 4
+                answers.append(response[response_offset:])
+
             # Build the DNS response packet with the specified header, question, and answer sections
-            response = build_dns_response(packet_id, opcode, rd, qdcount, questions)
+            response = build_dns_response(packet_id, opcode, rd, qdcount, questions, answers)
 
             # Send the response packet back to the client
             udp_socket.sendto(response, source)
